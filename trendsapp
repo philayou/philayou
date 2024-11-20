@@ -1,0 +1,133 @@
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import requests
+import time
+
+# Fetch data from Kraken
+def fetch_historical_data(pair='XBTUSD', interval=60, since=None):
+    url = 'https://api.kraken.com/0/public/OHLC'
+    params = {
+        'pair': pair,
+        'interval': interval,
+        'since': since or int(time.time()) - 86400
+    }
+    response = requests.get(url, params=params)
+    data = response.json()
+    if 'error' in data and data['error']:
+        st.error(f"API Error: {data['error']}")
+        return None
+    pair_data = data['result'][pair]
+    df = pd.DataFrame(pair_data, columns=['time', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'count'])
+    df['time'] = pd.to_datetime(df['time'], unit='s')
+    df = df.astype({'open': float, 'high': float, 'low': float, 'close': float, 'volume': float})
+    return df
+
+# Add indicators to the data
+def calculate_indicators(data):
+    data['EMA20'] = data['close'].ewm(span=20).mean()
+    data['MACD'] = data['close'].ewm(span=12).mean() - data['close'].ewm(span=26).mean()
+    data['Signal'] = data['MACD'].ewm(span=9).mean()
+    return data
+
+# Generate signals
+def generate_signals(data):
+    signals = []
+    for i in range(1, len(data)):
+        if data['EMA20'][i] > data['EMA20'][i-1] and data['MACD'][i] > data['Signal'][i]:
+            signals.append({'Type': 'Buy', 'Date': data['time'][i], 'Price': data['close'][i]})
+        elif data['EMA20'][i] < data['EMA20'][i-1] and data['MACD'][i] < data['Signal'][i]:
+            signals.append({'Type': 'Sell', 'Date': data['time'][i], 'Price': data['close'][i]})
+    return pd.DataFrame(signals)
+
+# Backtest the strategy
+def backtest(data, signals, initial_balance=1000):
+    balance = initial_balance
+    position = 0
+    for _, signal in signals.iterrows():
+        if signal['Type'] == 'Buy' and balance > 0:
+            position = balance / signal['Price']
+            balance = 0
+        elif signal['Type'] == 'Sell' and position > 0:
+            balance = position * signal['Price']
+            position = 0
+    final_balance = balance + (position * data['close'].iloc[-1])
+    return final_balance
+
+# Streamlit UI
+st.title("Trading Bot Dashboard")
+st.sidebar.header("Input Parameters")
+
+# User inputs
+symbol = st.sidebar.text_input("Symbol (Kraken pair)", value="XBTUSD")
+interval = st.sidebar.selectbox("Interval (minutes)", [1, 5, 15, 30, 60, 240, 1440], index=3)
+since_days = st.sidebar.number_input("Fetch Data Since (days ago)", min_value=1, max_value=365, value=7)
+
+# Fetch data
+if st.sidebar.button("Fetch Data"):
+    since = int(time.time()) - since_days * 86400
+    data = fetch_historical_data(pair=symbol, interval=interval, since=since)
+    if data is not None:
+        # Add indicators
+        data = calculate_indicators(data)
+
+        # Generate signals
+        signals = generate_signals(data)
+
+        # Backtest
+        final_balance = backtest(data, signals)
+
+        # Display OHLC chart with signals
+        st.subheader(f"OHLC Chart for {symbol}")
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.02)
+        candlestick = go.Candlestick(
+            x=data['time'],
+            open=data['open'],
+            high=data['high'],
+            low=data['low'],
+            close=data['close'],
+            name="OHLC"
+        )
+        ema20 = go.Scatter(
+            x=data['time'],
+            y=data['EMA20'],
+            mode='lines',
+            name='EMA20',
+            line=dict(color='orange')
+        )
+        fig.add_trace(candlestick, row=1, col=1)
+        fig.add_trace(ema20, row=1, col=1)
+
+        # Add MACD
+        macd = go.Scatter(
+            x=data['time'],
+            y=data['MACD'],
+            mode='lines',
+            name='MACD',
+            line=dict(color='blue')
+        )
+        signal = go.Scatter(
+            x=data['time'],
+            y=data['Signal'],
+            mode='lines',
+            name='Signal Line',
+            line=dict(color='red')
+        )
+        fig.add_trace(macd, row=2, col=1)
+        fig.add_trace(signal, row=2, col=1)
+
+        fig.update_layout(height=600, width=1000, title_text=f"{symbol} OHLC and Indicators")
+        st.plotly_chart(fig)
+
+        # Display signals
+        st.subheader("Generated Signals")
+        st.write(signals)
+
+        # Display backtest results
+        st.subheader("Backtesting Results")
+        st.write(f"Final Balance: ${final_balance:.2f}")
+
+    else:
+        st.error("Failed to fetch data. Please check the inputs.")
+
